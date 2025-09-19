@@ -1,0 +1,97 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import numpy as np
+from collections import OrderedDict
+
+"""
+We provide the models, which might be used in the experiments on FedD3, as follows:
+    - AlexNet model customized for CIFAR-10 (AlexCifarNet) with 1756426 parameters
+    - LeNet model customized for MNIST with 61706 parameters
+    - Further ResNet models
+    - Further Vgg models
+"""
+
+class OptiFocusBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(OptiFocusBlock, self).__init__()
+
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=3, padding=1),  
+            nn.Sigmoid()
+        )
+
+    def calculate_distance_weights(self, x):
+       
+        batch_size, channels, height, width = x.size()
+
+ 
+        grid_x, grid_y = torch.meshgrid(torch.arange(height), torch.arange(width))
+        center_x, center_y = height // 2, width // 2
+        
+        distance_map = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2
+        distance_map = torch.sqrt(distance_map.float())  
+
+        distance_map = distance_map / distance_map.max()
+
+        distance_map = distance_map.unsqueeze(0).unsqueeze(0) 
+        distance_map = distance_map.expand(batch_size, 1, height, width)
+
+        return distance_map
+
+    def forward(self, x):
+        device = x.device
+        channel_attention = self.channel_attention(x)
+        x = x * channel_attention
+
+        spatial_avg = torch.mean(x, dim=1, keepdim=True)
+        spatial_max = torch.max(x, dim=1, keepdim=True)[0]
+        spatial = torch.cat([spatial_avg, spatial_max], dim=1)
+        spatial_attention = self.spatial_attention(spatial)
+
+        distance_weights = self.calculate_distance_weights(x).to(device)
+        spatial_attention = spatial_attention.to(device)
+        spatial_attention = spatial_attention * distance_weights
+
+        return x * spatial_attention
+
+
+# Further ResNet models
+def generate_resnet(num_classes=10, in_channels=1, model_name="ResNet18"):
+    if model_name == "ResNet18":
+        model = models.resnet18(pretrained=True)
+    elif model_name == "ResNet34":
+        model = models.resnet34(pretrained=True)
+    elif model_name == "ResNet50":
+        model = models.resnet50(pretrained=True)
+    elif model_name == "ResNet101":
+        model = models.resnet101(pretrained=True)
+    elif model_name == "ResNet152":
+        model = models.resnet152(pretrained=True)
+    model.conv1 = nn.Conv2d(in_channels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+    model.layer1 = nn.Sequential(
+            model.layer1,
+            OptiFocusBlock(64)  # Insert OptiFocusBlock after the first residual block in layer1
+        )
+    fc_features = model.fc.in_features
+    model.fc = nn.Linear(fc_features, num_classes)
+
+    return model
+
+
+if __name__ == "__main__":
+    model_name_list = ["ResNet18", "ResNet34", "ResNet50", "ResNet101", "ResNet152"]
+    for model_name in model_name_list:
+        model = generate_resnet(num_classes=10, in_channels=1, model_name=model_name)
+        model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+        param_len = sum([np.prod(p.size()) for p in model_parameters])
+        print('Number of model parameters of %s :' % model_name, ' %d ' % param_len)
