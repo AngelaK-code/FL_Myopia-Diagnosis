@@ -1,0 +1,209 @@
+from utils.models import *
+import torch
+from torch.utils.data import DataLoader
+from utils.fed_utils import assign_dataset, init_model, refine_weight_dict_by_GA
+from sklearn.metrics import roc_auc_score
+from collections import defaultdict
+import random
+
+class FedServer(object):
+    def __init__(self, client_list, dataset_id, model_name):
+        """
+        Initialize the server for federated learning.
+        :param client_list: List of the connected clients in networks
+        :param dataset_id: Dataset name for the application scenario
+        :param model_name: Machine learning model name for the application scenario
+        """
+        # Initialize the dict and list for system settings
+        self.client_state = {}
+        self.client_loss = {}
+        self.client_acc = {}
+        self.client_n_data = {}
+        self.selected_clients = []
+        # batch size for testing
+        self._batch_size = 200
+        self.client_list = client_list
+
+        # Initialize the test dataset
+        self.testset = None
+
+        # Initialize the hyperparameter for federated learning in the server
+        self.round = 0
+        self.n_data = 0
+        self._dataset_id = dataset_id
+
+        # Testing on GPU
+        gpu = 0
+        self._device = torch.device("cuda:{}".format(gpu) if torch.cuda.is_available() and gpu != -1 else "cpu")
+
+        # Initialize the global machine learning model
+        self._num_class, self._image_dim, self._image_channel = assign_dataset(dataset_id)
+        self.model_name = model_name
+        self.model = init_model(model_name=self.model_name, num_class=self._num_class, image_channel=self._image_channel)
+
+    def load_testset(self, testset):
+        """
+        Server loads the test dataset.
+        :param data: Dataset for testing.
+        """
+        self.testset = testset
+
+    def state_dict(self):
+        """
+        Server returns global model dict.
+        :return: Global model dict
+        """
+        return self.model.state_dict()
+    def test(self):
+        """
+        Server tests the model on test dataset and calculates accuracy and AUC.
+        Also tracks misclassifications for each class and calculates the most frequent misclassification.
+        """
+        test_loader = DataLoader(self.testset, batch_size=self._batch_size, shuffle=True)
+        self.model.to(self._device)
+
+        accuracy_collector = 0
+        all_labels = []  # To store all true labels
+        all_preds = []  # To store all predicted probabilities
+        misclassifications = defaultdict(
+            lambda: defaultdict(int))  # Dictionary to store misclassifications per class and target class
+        true_counts = defaultdict(int)  # Dictionary to store true counts of each class
+        correct_counts = defaultdict(int)  # Dictionary to store correct predictions per class
+        possible_classes = {0, 1, 2}  # Adjust this based on your actual classes
+
+        for step, (x, y) in enumerate(test_loader):
+            with torch.no_grad():
+                b_x = x.to(self._device)  # Tensor on GPU
+                b_y = y.to(self._device)  # Tensor on GPU
+
+                # Forward pass through the model
+                test_output = self.model(b_x)
+
+                # Get predicted classes
+                pred_y = torch.max(test_output, 1)[1].to(self._device).data.squeeze()
+                accuracy_collector += sum(pred_y == b_y)
+
+                # Track misclassifications and true class counts
+                for true_label, pred_label in zip(b_y.cpu().numpy(), pred_y.cpu().numpy()):
+                    true_counts[true_label] += 1
+                    if true_label == pred_label:
+                        correct_counts[true_label] += 1
+                    else:
+                        misclassifications[true_label][pred_label] += 1
+
+                # For AUC, collect the predicted probabilities and true labels
+                all_labels.append(b_y.cpu().numpy())
+                all_preds.append(torch.softmax(test_output, dim=1).cpu().numpy())  # Get class probabilities
+
+        # Calculate overall accuracy
+        accuracy = accuracy_collector / len(self.testset)
+
+        # Calculate AUC (assuming binary classification or one-vs-all for multi-class)
+        all_labels = np.concatenate(all_labels)
+        all_preds = np.concatenate(all_preds)
+        auc = roc_auc_score(all_labels, all_preds, multi_class='ovr', average='macro')
+
+        # Calculate accuracy for each class
+        class_accuracies = {}
+        for cls in possible_classes:
+            if true_counts[cls] > 0:  # Avoid division by zero
+                class_accuracies[cls] = correct_counts[cls] / true_counts[cls]
+            else:
+                class_accuracies[cls] = 0.0  # If no samples of this class exist in the test set
+
+        # Print the accuracy per class
+        for cls, accuracy in class_accuracies.items():
+            print(f"Class {cls} accuracy: {accuracy:.4f}")
+
+        return accuracy, auc, all_labels, all_preds
+    def select_clients(self, connection_ratio=1):
+        """
+        Server selects a fraction of clients.
+        :param connection_ratio: connection ratio in the clients
+        """
+        # select a fraction of clients
+        self.selected_clients = []
+        self.n_data = 0
+        for client_id in self.client_list:
+            b = np.random.binomial(np.ones(1).astype(int), connection_ratio)
+            if b:
+                self.selected_clients.append(client_id)
+                self.n_data += self.client_n_data[client_id]
+    def agg(self):
+        """
+        Server aggregates models from connected clients with dynamic aggregation strategy.
+        :return: model_state: Updated global model after aggregation
+        :return: avg_loss: Averaged loss value
+        :return: n_data: Number of the local data points
+        """
+        client_num = len(self.selected_clients)
+        if client_num == 0 or self.n_data == 0:
+            return self.model.state_dict(), 0, 0
+
+        # Initialize a model for aggregation
+        model = init_model(model_name=self.model_name, num_class=self._num_class, image_channel=self._image_channel)
+        model_state = model.state_dict()
+        avg_loss = 0
+
+        # Initialize the total weight
+        total_weight = 0.0
+
+        # Aggregate the local updated models from selected clients
+        for i, name in enumerate(self.selected_clients):
+            if name not in self.client_state:
+                continue
+
+            # Dynamic weight based on the client's loss
+            client_loss = self.client_loss[name]
+
+
+            # A simple dynamic weight strategy: lower loss -> higher weight
+            client_weight = 1.0 / (1 + client_loss)  # You can adjust this formula
+            total_weight += client_weight
+
+            # Aggregate the model parameters with dynamic weights
+            for key in self.client_state[name]:
+                if i == 0:
+                    model_state[key] = self.client_state[name][key] * client_weight
+                else:
+                    model_state[key] += self.client_state[name][key] * client_weight
+
+            avg_loss += client_loss * self.client_n_data[name] / self.n_data
+
+        # Normalize the model state by the total weight
+        if total_weight > 0:
+            for key in model_state:
+                model_state[key] /= total_weight
+
+
+        # Server load the aggregated model as the global model
+        self.model.load_state_dict(model_state)
+        self.round += 1
+        n_data = self.n_data
+
+        return model_state, avg_loss, n_data
+    def rec(self, name, state_dict, n_data, loss):
+        """
+        Server receives the local updates from the connected client k.
+        :param name: Name of client k
+        :param state_dict: Model dict from the client k
+        :param n_data: Number of local data points in the client k
+        :param loss: Loss of local training in the client k
+        """
+        self.n_data = self.n_data + n_data
+        self.client_state[name] = {}
+        self.client_n_data[name] = {}
+
+        self.client_state[name].update(state_dict)
+        self.client_n_data[name] = n_data
+        self.client_loss[name] = {}
+        self.client_loss[name] = loss
+
+    def flush(self):
+        """
+        Flushing the client information in the server
+        """
+        self.n_data = 0
+        self.client_state = {}
+        self.client_n_data = {}
+        self.client_loss = {}
